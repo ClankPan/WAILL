@@ -1,0 +1,268 @@
+
+!(defrec bind (lambda (vars vals)
+  (if (eq nil vars) nil
+      (cons (cons (car vars) (cons (cons 'quote (cons (car vals) nil)) nil)) (bind (cdr vars) (cdr vals)))  
+      )))
+
+!(def bind-env (lambda (vars vals env)
+  (if (eq nil vars) env
+      (eval
+        (cons 'let (cons (bind vars vals) '((current-env))))
+        env))))
+
+!(def get-val (lambda (var env mem)
+  (eval (eval var env) mem)))
+
+!(defrec extract-adders (lambda (vars addrs mem-addrs)
+  (if (eq nil vars)
+      (cons addrs mem-addrs)
+      (extract-adders (cdr vars)
+                      (cons (car mem-addrs) addrs)
+                      (cdr mem-addrs)))))
+
+!(def get-addrs (lambda (vars mem)
+  (extract-adders vars '() (eval '&mem-addrs mem))))
+
+!(defrec _eval
+  (lambda (expr env mem cont)
+          (if (atom expr)
+              (cont (get-val expr env mem) mem) ;; Self evaluable expression
+              (_eval (car expr) env mem
+                (lambda (proc mem)
+                        (proc (cdr expr) env mem cont)))))) ;; (cdr expr) is a argument list
+
+!(defrec map-eval
+  (lambda (args env mem0 cont)
+    (if (eq nil args)
+        (cont   '() mem0)
+        (_eval  (car args) env mem0
+                (lambda (x mem1)
+                        (map-eval (cdr args) env mem1
+                          (lambda (y mem2)
+                                  (cont (cons x y) mem2))))))))
+
+!(defrec eval-body
+  (lambda (body env mem0 cont)
+          (if (eq nil (cdr body))
+              (_eval
+                (car body) env mem0 cont)
+              (_eval
+                (car body) env mem0 ;; Note: Updating env in _eval does not effect next evaluation as env is not passed to cont.
+                (lambda (value mem1)
+                        (eval-body
+                          (cdr body) env mem1 cont))))))
+
+;; Warn: Above functions are included in the env. (todo fix)
+!(def init-global-env
+  (let    
+         (
+          ;; Primitives
+          (car   (lambda  (arg-expr env mem cont)
+                          (map-eval
+                            arg-expr env mem ;; Pass unevalued args & env
+                            (lambda (actuals mem)
+                                    (cont
+                                      (car (car actuals))
+                                      mem))))) ;; Get 'CAR' from actuals
+
+          (cdr   (lambda  (arg-expr env mem cont)
+                          (map-eval
+                            arg-expr env mem
+                            (lambda (actuals mem)
+                                    (cont
+                                      (cdr (car actuals))
+                                      mem))))) ;; Get 'CAR' from actuals
+
+          (cons   (lambda (arg-expr env mem cont)
+                          (map-eval
+                            arg-expr env mem 
+                            (lambda (actuals mem)
+                                    (cont
+                                      (cons (car actuals)  (car (cdr actuals)))
+                                      mem))))) ;; Cons
+
+          (equal? (lambda (arg-expr env mem cont)
+                          (map-eval
+                            arg-expr env mem
+                            (lambda (actuals mem)
+                                    (cont
+                                      (eq (car actuals) (car (cdr actuals)))
+                                      mem)))))
+
+          (atom (lambda (arg-expr env mem cont)
+                          (map-eval
+                            arg-expr env mem
+                            (lambda (actuals mem)
+                                    (cont
+                                      (atom (car actuals))
+                                      mem)))))
+                                      
+          (call/cc (lambda  (arg-expr env mem0 lex-cont)
+
+                                      ;; Note: The current continuation must be bound to a lambda formal symbol.
+                                      ;;       Unlike evaluation of lambda expression, the lambda expression of call/cc must be evaluated as closure.
+                                      ;;
+                                      (let  ( (formals (car (cdr (car arg-expr))))
+                                              (addrs&mem-addrs (get-addrs formals mem0)))
+
+                                            (eval-body ;; bind 'continuation' to the formal symbol
+                                              (cdr (cdr (car arg-expr))) ;; body
+                                              (bind-env ;; env
+                                                formals
+                                                (car addrs&mem-addrs)
+                                                env)
+                                              (bind-env ;; mem
+                                                (cons '&mem-addrs (car addrs&mem-addrs))
+                                                (cons (cdr addrs&mem-addrs)
+                                                      (cons
+                                                        (lambda (arg-expr env mem1 cont)
+                                                                (map-eval
+                                                                  arg-expr env mem1
+                                                                  (lambda (a mem2) ;; wrap cont to accept mem state
+                                                                          (lex-cont (car a) mem2))))
+                                                        nil))
+                                                mem0)
+                                              lex-cont)
+                                              
+                                              )))
+          ;; Memo: Is it possible to bind the symbol itself instead of using addr when lambda expr?
+          (set! (lambda (arg-expr env mem cont) ;; Note: set! returns value
+                        (map-eval (cdr arg-expr) env mem
+                                  (lambda (actuals mem)
+                                          (cont
+                                            (car actuals)
+                                            (bind-env ;; Write a new value to mem.
+                                              (cons (eval (car arg-expr) env) nil) ;; ToDo: bind-env accepts single value.
+                                              (cons (car actuals) nil)
+                                              mem))))))
+          ;; Note: In Scheme the argument passing strategy is 'call-by-sharing', which looks like almost 'call-by-value'. However actually a pointer is passed to function, not a copy of value.
+          ;;       Thus in the case of '(define x y)' the x and y has same pointer. (eq? x y) will be true.
+          ;;       When set! is called, set! replaces the pointer bound the symbol with a new pointer.
+          ;;       
+
+
+          ;; ToDo
+          ;; (eq?   '(&primitive eq?))
+          (pair? '(&primitive pair?))
+          (apply '(apply))
+
+          ;; Syntaxies
+          (quote  (lambda (arg-expr env mem cont)
+                          (cont (car arg-expr )mem)))
+
+          (lambda (lambda (lex-arg-expr lex-env mem0 lex-cont) ;; lex-arg-expr is ((<arg>) (<body>))
+                          (lex-cont
+                            (lambda (arg-expr env mem1 cont)
+                                    (map-eval
+                                      arg-expr
+                                      env 
+                                      mem1
+                                      (lambda (actuals mem2)
+                                                (let  ( (formals (car lex-arg-expr)) ;; '(car lex-arg-expr) is arg symbol
+                                                        (addrs&mem-addrs (get-addrs formals mem2)))
+                                                      (eval-body
+                                                        (cdr lex-arg-expr) ;; lambda body
+                                                        (bind-env
+                                                          formals
+                                                          (car addrs&mem-addrs)
+                                                          lex-env) ;; Use lexical enviroment
+                                                        (bind-env
+                                                          (cons '&mem-addrs (car addrs&mem-addrs))
+                                                          (cons (cdr addrs&mem-addrs) actuals)
+                                                          mem2)
+                                                        cont)))))     
+                            mem0)))
+
+          (if (lambda (arg-expr env mem0 cont)
+                      (_eval
+                        (car arg-expr)
+                        env
+                        mem0
+                        (lambda (pred mem1)
+                                (if pred
+                                    (_eval (car (cdr arg-expr)) env mem1 cont) ;; then clause
+                                    (_eval (car (cdr (cdr arg-expr))) env mem1 cont)))))) ;; else clause
+
+          ;; ToDo
+          ;; (define-macro '(defmacro))
+          ;; (label <symbol> (lambda ...))
+
+          )
+        (current-env)))
+
+
+!(def init-env  (bind-env '(x y z) '(_x _y _z) init-global-env))
+
+!(def initial-mem
+  (bind-env '(_x _y _z) '(1 2 (3 4)) '()))
+
+
+!(def initial-mem
+  (bind-env
+    '(&mem-addrs)
+    '( (a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15
+        b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15
+        c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15
+        d0 d1 d2 d3 d4 d5 d6 d7 d8 d9 d10 d11 d12 d13 d14 d15
+        e0 e1 e2 e3 e4 e5 e6 e7 e8 e9 e10 e11 e12 e13 e14 e15
+        f0 f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13 f14 f15
+        g0 g1 g2 g3 g4 g5 g6 g7 g8 g9 g10 g11 g12 g13 g14 g15
+        h0 h1 h2 h3 h4 h5 h6 h7 h8 h9 h10 h11 h12 h13 h14 h15
+        i0 i1 i2 i3 i4 i5 i6 i7 i8 i9 i10 i11 i12 i13 i14 i15
+        j0 j1 j2 j3 j4 j5 j6 j7 j8 j9 j10 j11 j12 j13 j14 j15
+        k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 k10 k11 k12 k13 k14 k15
+        l0 l1 l2 l3 l4 l5 l6 l7 l8 l9 l10 l11 l12 l13 l14 l15
+        m0 m1 m2 m3 m4 m5 m6 m7 m8 m9 m10 m11 m12 m13 m14 m15 
+        n0 n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 n13 n14 n15
+        o0 o1 o2 o3 o4 o5 o6 o7 o8 o9 o10 o11 o12 o13 o14 o15
+        p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p12 p13 p14 p15
+        q0 q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15
+        r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 r12 r13 r14 r15
+        s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15
+        t0 t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15
+        u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15
+        v0 v1 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12 v13 v14 v15
+        w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15
+        x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15
+        y0 y1 y2 y3 y4 y5 y6 y7 y8 y9 y10 y11 y12 y13 y14 y15
+        z0 z1 z2 z3 z4 z5 z6 z7 z8 z9 z10 z11 z12 z13 z14 z15
+        ))
+    initial-mem))
+
+!(defrec top-eval-loop
+  (lambda (expr env mem0)
+          (if (eq nil (cdr expr))
+              (_eval (car expr) env mem0 (lambda (e m) e)) ;; The last expr must not be define
+              (if (eq 'define (car (car expr)))
+                  (let  ( (sym (cons (car (cdr (car expr))) nil))
+                          (addrs&mem-addrs (get-addrs sym mem0))
+                          (new-env (bind-env sym (car addrs&mem-addrs) env))
+                          (new-mem
+                            (bind-env ;; Update '&mem-addrs symbol list
+                              (cons '&mem-addrs nil)
+                              (cons (cdr addrs&mem-addrs) nil)
+                              mem0)))
+                        (top-eval-loop
+                          (cdr expr)
+                          new-env
+                          (_eval
+                            (car (cdr (cdr (car expr)))) ;; define body expr
+                            new-env new-mem
+                            (lambda (proc mem1)
+                                    ((lambda (e m) m)
+                                      (car sym)
+                                      (bind-env。
+                                        (car addrs&mem-addrs) (cons proc nil) mem1))))))
+
+                  (if (eq 'define-macro (car (car expr))) 'define-macro
+                      (top-eval-loop
+                        (cdr expr)
+                        env
+                        (_eval (car expr) env mem0 (lambda (e m) m)))))
+
+              )))
+
+
+
+!(def exec (lambda (expr)
+  (_eval expr init-env initial-mem (lambda (a mem) a))))
